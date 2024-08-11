@@ -1,0 +1,32 @@
+dataset:
+  # train_label: null
+  # val_label: null
+  train_root: ./train
+  val_root: ./val
+  sample_ratio: null
+  batch_size: 32
+image_config:
+  aug_level: lo
+  imgsz: [300, 480]
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  to_rgb: true
+device_config:
+  device_id: 0
+  num_worker: 4
+train_config:
+  random_seed: 42
+  # loss_smoothing: 0.2
+  # loss_weight: [0.4, 0.6]
+  lr: 1.0e-3
+  epochs: 30
+  patience: null
+  ema: true
+  log_path: tensorboard/cccd-chip-classify
+  ckpt_path: weights/cccd-chip-classify
+model:
+  arch: efficientnet_b0
+  pretrained: true
+  ckpt_path: null
+  n_block_to_train: -1
+  dropout: 0.1
