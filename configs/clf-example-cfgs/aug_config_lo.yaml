@@ -1,0 +1,48 @@
+augmentations:
+  - name: resize
+    imgsz: 224
+
+  - name: GaussNoise
+    params:
+      p: 0.2
+
+  - name: OneOf
+    params:
+      p: 0.2
+    augmentations:
+      - name: MotionBlur
+        params:
+          p: 0.2
+
+      - name: MedianBlur
+        params:
+          blur_limit: 3
+          p: 0.1
+
+      - name: Blur
+        params:
+          blur_limit: 3
+          p: 0.1
+
+  - name: HueSaturationValue
+    params:
+      p: 0.3
+
+  - name: ShiftScaleRotate
+    params:
+      shift_limit: 0.025
+      rotate_limit: 10
+      shift_limit_x: 0.025
+      shift_limit_y: 0.025
+      p: 0.3
+
+  - name: ImageCompression
+    params:
+      quality_lower: 90
+
+  - name: Normalize
+    params:
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+
+to_rgb: true

@@ -1,0 +1,1 @@
+python onnx_export.py weights/check-wm/20240821-1725/convnext_femto.onnx --model convnext_femto --opset 12 --batch-size 1 --img-size 500 800 --mean 0.485 0.456 0.406 --std 0.229 0.224 0.225 --num-classes 2 --checkpoint weights/check-wm/20240821-1725/epoch_47.pth

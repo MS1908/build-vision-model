@@ -1,0 +1,5 @@
+arch: convnext_atto
+pretrained: true
+ckpt_path: null
+n_block_to_train: -1
+dropout: 0.1

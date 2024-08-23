@@ -316,4 +316,4 @@ dependencies:
     - yapf==0.40.2
     - ydf==0.6.0
     - zipp==3.19.2
-prefix: 
+prefix: /home/minhnq54/anaconda3/envs/ml-base-env

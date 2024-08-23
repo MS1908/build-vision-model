@@ -1,0 +1,4 @@
+train_root: /home/minh/Desktop/datasets/dogs-vs-cats/images/train
+val_root: /home/minh/Desktop/datasets/dogs-vs-cats/images/val
+sample_ratio: null
+batch_size: 8

@@ -1,0 +1,17 @@
+image_config:
+  imgsz: [500, 800]
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  to_rgb: true
+model:
+  arch: convnext_pico
+  pretrained: false
+  ckpt_path: weights/check-wm/20240821-0429/convnext_pico.onnx
+  n_classes: 2
+infer_config:
+  mode: binary
+  thres: 0.37
+device_id: 0
+dataset:
+  annot: val_annot.csv
+  lit_labels: ['0--no-wm', '1--wm']

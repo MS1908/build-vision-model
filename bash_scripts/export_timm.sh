@@ -1,1 +1,0 @@
-python onnx_export.py save_converted_onnx_path --model efficientnet_b0 --opset 12 --batch-size 1 --img-size 300 480 --mean 0.485 0.456 0.406 --std 0.229 0.224 0.225 --num-classes 5 --checkpoint ckpt_path

@@ -1,0 +1,10 @@
+student_model:
+  arch: mobilenetv3_small_050
+  pretrained: true
+  ckpt_path: null
+  n_block_to_train: -1
+  dropout: 0.1
+teacher_model:
+  arch: convnext_atto
+  pretrained: false
+  ckpt_path: weights/classify_dog_cat/20240824-0115/epoch_1.pth

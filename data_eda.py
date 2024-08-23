@@ -5,7 +5,7 @@ from PIL import Image
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from tqdm import tqdm
-from vision_classification import albu_img_prepro
+from deep_learning_utils import albu_img_prepro
 
 IMAGE_EXTS = ['jpg', 'png', 'jpeg', 'JPG', 'PNG', 'JPEG']
 

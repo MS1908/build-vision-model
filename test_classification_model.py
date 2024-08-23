@@ -9,8 +9,10 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from model_performance_report_utils import compute_stats, plot_multiclass_pr_curve, plot_binary_pr_curve
-from vision_classification import (classify, binary_classify, classify_onnx, binary_classify_onnx, 
-                                   build_timm_model, model_summary, ImageDataset, albu_img_prepro)
+from data_utils import ImageDataset, albu_img_prepro
+from deep_learning_utils import (classify, binary_classify, classify_onnx, binary_classify_onnx, 
+                                 build_timm_model)
+from misc_utils import model_summary
 
 
 def model_evaluation(

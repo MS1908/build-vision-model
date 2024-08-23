@@ -1,31 +1,25 @@
 import argparse
-import copy
 import json
-import math
 import os
 import random
 import torch
 import warnings
 import yaml
 import numpy as np
+import pandas as pd
 import pytorch_warmup as warmup
-import torch.nn.functional as F
 from timm.utils import ModelEmaV2
-from torch import nn
+from torch import optim
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
+from torchmetrics import F1Score
 
-from vision_classification import build_timm_model, model_summary, create_data_loader
+from data_utils import create_data_loader
+from deep_learning_utils import build_timm_model, KDLoss
+from misc_utils import model_summary, check_classification_model_metric_is_best
 
 warnings.filterwarnings("ignore")
-
-
-def criterion_kd(outputs, teacher_outputs, targets, alpha, temperature):
-    kd_loss = (nn.KLDivLoss()(F.log_softmax(outputs / temperature, dim=1), 
-                              F.softmax(teacher_outputs / temperature, dim=1)) * alpha * temperature * temperature + 
-               F.cross_entropy(outputs, targets) * (1 - alpha))
-    return kd_loss
 
 
 def set_all_seeds(seed):
@@ -38,262 +32,319 @@ def set_all_seeds(seed):
 
 
 def train(
-    model,
-    teacher_model,
-    device,
-    train_loader,
-    val_loader,
-    alpha,
-    temperature,
-    optimizer,
-    scheduler,
-    update_scheduler_by_iter,
-    update_scheduler_with_metric,
-    epochs,
-    patience=None,
-    ckpt_path=None,
-    log_path=None
+    aug_config,
+    dataset_config,
+    model_config,
+    train_config
 ):
-    best_acc = float('-inf')
-    best_train_acc = float('-inf')
+    seed = train_config.get('random_seed', None)
+    if seed:
+        set_all_seeds(seed)
+
+    device_id = train_config.get('device_id', -1)
+    use_gpu = torch.cuda.is_available() and device_id != -1
+    device = torch.device(f"cuda:{device_id}" if use_gpu else "cpu")
+    num_workers = train_config.get('num_worker', 1)
     
-    if log_path:
-        logger = SummaryWriter(log_path)
-        logger.add_scalar('Accuracy/val', 0., 0)
+    num_epochs = train_config.get('epochs', 1)
+    patience = train_config.get('patience', None)
+
+    train_loader, n_classes = create_data_loader(
+        dataset_config=dataset_config,
+        aug_config=aug_config,
+        num_worker=num_workers,
+        mode='train',
+        return_classes=False,
+        random_seed=seed
+    )
+    val_loader, _ = create_data_loader(
+        dataset_config=dataset_config,
+        aug_config=aug_config,
+        num_worker=num_workers,
+        mode='val',
+        return_classes=False,
+        random_seed=seed
+    )
+
+    model = build_timm_model(config=model_config['student_model'], n_classes=n_classes, device=device, phase='train')
+    print('Student model')
+    model_summary(model)
+    
+    teacher_model = build_timm_model(config=model_config['teacher_model'], n_classes=n_classes, device=device, phase='val')
+    print('Teacher model')
+    model_summary(teacher_model)
+
+    alpha = train_config.get('alpha', 0.5)  # Default alpha value for KD loss
+    temperature = train_config.get('temperature', 1.)
+    criterion = KDLoss(alpha=alpha, temperature=temperature)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=train_config.get('lr', 1e-3))
+    
+    total_iters = num_epochs * len(train_loader)
+    warmup_iters = total_iters // 6
+    train_iters = total_iters - warmup_iters
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_iters)
+    warmup_scheduler = warmup.LinearWarmup(optimizer, warmup_iters)
+    
+    use_ema = train_config.get('ema', False)
+
+    exp_name = train_config.get('exp', 'exp')
+    date_str = datetime.now().strftime('%Y%m%d-%H%M')
+    
+    ckpt_path = os.path.join('weights', exp_name, date_str)
+    os.makedirs(ckpt_path, exist_ok=True)
+    log_path = os.path.join('logs', exp_name, date_str)
+
+    resize_cfg = aug_config.get('resize', None)
+    imgsz = None if resize_cfg is None else resize_cfg['imgsz']
+    norm_cfg = aug_config.get('Normalize', None)
+    mean = None if norm_cfg is None else norm_cfg['params']['mean']
+    std = None if norm_cfg is None else norm_cfg['params']['std']
+    model_config_to_save = {
+        'arch': model_config['student_model']['arch'],
+        'n_classes': n_classes,
+        'imgsz': imgsz,
+        'mean': mean,
+        'std': std
+    }
+    json.dump(model_config_to_save, open(os.path.join(ckpt_path, 'model_config.json'), 'w'))
+
+    if use_ema:
+        df = pd.DataFrame(columns=['epoch', 'val_f1', 'val_ema_f1', 'val_acc', 'val_ema_acc', 
+                                   'train_f1', 'train_ema_f1', 'train_acc', 'train_ema_acc'])
     else:
-        logger = None
+        df = pd.DataFrame(columns=['epoch', 'val_f1', 'val_acc', 'train_f1', 'train_acc'])
     
-    model_ema = ModelEmaV2(model=model, device=device, decay=0.998)
+    best_metric = {
+        'f1': float('-inf'),
+        'train_f1': float('-inf'),
+        'acc': float('-inf'),
+        'train_acc': float('-inf')
+    }
+    
+    logger = SummaryWriter(log_path)
+    logger.add_scalar('Accuracy/val', 0., 0)
+    
+    if use_ema:
+        model_ema = ModelEmaV2(model=model, device=device, decay=0.998)
+    else:
+        model_ema = None
+        
+    scaler = torch.cuda.amp.GradScaler()
     
     cnt_not_improve = 0
-    
-    best_model = None
-    teacher_model.to(device)
-    teacher_model.eval()
-    for epoch in range(epochs):
+
+    if n_classes > 2:
+        f1_score = F1Score(task='multiclass', num_classes=n_classes)
+    else:
+        f1_score = F1Score(task='binary')
+    f1_score = f1_score.to(device)
+
+    for epoch in range(num_epochs):
         model.train()
-        pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Train epoch {epoch + 1}/{epochs}")
+        pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Train epoch {epoch + 1}/{num_epochs}")
+        
         total = 0
         correct = 0
-        correct_ema = 0
+        ema_correct = 0
+        total_f1 = 0
+        total_ema_f1 = 0
+        
         for i, (images, targets) in pbar:
             images = images.to(device)
             targets = targets.to(device)
 
             optimizer.zero_grad()
 
-            outputs = model(images)
-            outputs_ema = model_ema.module(images)
-            with torch.no_grad():
-                teacher_outputs = teacher_model(images)
-            loss = criterion_kd(outputs, teacher_outputs, targets, alpha, temperature)
+            with torch.cuda.amp.autocast():
+                outputs = model(images)
+                
+                with torch.no_grad():
+                    teacher_outputs = teacher_model(images)
+                
+                loss = criterion(outputs, teacher_outputs, targets)
+                
+                if model_ema:
+                    outputs_ema = model_ema.module(images)
+                    ema_loss = criterion(outputs_ema, teacher_outputs, targets)
             
-            loss.backward()
-            optimizer.step()
-            model_ema.update(model)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             _, predicted = torch.max(outputs.data, 1)
-            _, predicted_ema = torch.max(outputs_ema.data, 1)
+            
+            if model_ema:
+                model_ema.update(model)
+                _, predicted_ema = torch.max(outputs_ema.data, 1)
             
             total += targets.size(0)
             correct += (predicted == targets).sum().item()
-            correct_ema += (predicted_ema == targets).sum().item()
+            cur_f1 = f1_score(predicted, targets)
+            total_f1 += cur_f1.item()
+            if model_ema:
+                ema_correct += (predicted_ema == targets).sum().item()
+                cur_ema_f1 = f1_score(predicted_ema, targets)
+                total_ema_f1 += cur_ema_f1.item()
             
             lr = optimizer.param_groups[0]['lr']
 
-            pbar.set_postfix(loss=loss.item(), train_acc=correct / total, ema_train_acc=correct_ema / total, lr=lr)
-            if logger:
-                logger.add_scalar('Loss/train', loss.item(), epoch * len(train_loader) + i)
-                logger.add_scalar('Accuracy/train', correct / total, epoch * len(train_loader) + i)
-                logger.add_scalar('EMA accuracy/train', correct_ema / total, epoch * len(train_loader) + i)
-                logger.add_scalar('Learning rate', lr, epoch * len(train_loader) + i)
+            if use_ema:
+                pbar.set_postfix(loss=loss.item(), ema_loss=ema_loss.item(), 
+                                 train_acc=correct / total, ema_train_acc=ema_correct / total, 
+                                 f1=total_f1 / (i + 1), ema_f1=total_ema_f1 / (i + 1),
+                                 lr=lr)
+            else:
+                pbar.set_postfix(loss=loss.item(), train_acc=correct / total, f1=total_f1 / (i + 1), lr=lr)
             
-            if update_scheduler_by_iter:  # Update scheduler after each iteration
-                scheduler.step()
+            logger.add_scalar('Loss/train', loss.item(), epoch * len(train_loader) + i)
+            logger.add_scalar('Accuracy/train', correct / total, epoch * len(train_loader) + i)
+            logger.add_scalar('F1 score/train', total_f1 / (i + 1), epoch * len(train_loader) + i)
+            logger.add_scalar('Learning rate', lr, epoch * len(train_loader) + i)
+            
+            if use_ema:
+                logger.add_scalar('EMA loss/train', ema_loss.item(), epoch * len(train_loader) + i)
+                logger.add_scalar('EMA accuracy/train', ema_correct / total, epoch * len(train_loader) + i)
+                logger.add_scalar('EMA F1 score/train', total_ema_f1 / (i + 1), epoch * len(train_loader) + i)
+                
+            with warmup_scheduler.dampening():
+                if warmup_scheduler.last_step + 1 >= warmup_iters:
+                    lr_scheduler.step()
 
         train_acc = correct / total
-        train_acc_ema = correct_ema / total
+        train_f1 = total_f1 / len(train_loader)
+        if use_ema:
+            train_ema_acc = ema_correct / total
+            train_ema_f1 = total_ema_f1 / len(train_loader)
         
         model.eval()
-        pbar = tqdm(enumerate(val_loader), total=len(val_loader), desc=f"Val epoch {epoch + 1}/{epochs}")
+        pbar = tqdm(enumerate(val_loader), total=len(val_loader), desc=f"Val epoch {epoch + 1}/{num_epochs}")
+        
         total = 0
         correct = 0
-        correct_ema = 0
+        ema_correct = 0
+        total_f1 = 0
+        total_ema_f1 = 0
+        val_loss = 0
+        
         with torch.no_grad():
             for i, (images, targets) in pbar:
                 images = images.to(device)
                 targets = targets.to(device)
 
-                outputs = model(images)
-                outputs_ema = model_ema.module(images)
+                with torch.cuda.amp.autocast():
+                    outputs = model(images)
+                    teacher_outputs = teacher_model(images)
+                    loss = criterion(outputs, teacher_outputs, targets)
+                    val_loss += loss.item()
+                    
+                    if model_ema:
+                        outputs_ema = model_ema.module(images)
                 
-                scores, predicted = torch.max(outputs.data, 1)
-                scores_ema, predicted_ema = torch.max(outputs_ema.data, 1)
+                _, predicted = torch.max(outputs.data, 1)
+                if use_ema:
+                    _, predicted_ema = torch.max(outputs_ema.data, 1)
+                
+                cur_f1 = f1_score(predicted, targets)
+                if use_ema:
+                    cur_ema_f1 = f1_score(predicted_ema, targets)
                 
                 total += targets.size(0)
                 correct += (predicted == targets).sum().item()
-                correct_ema += (predicted_ema == targets).sum().item()
-                pbar.set_postfix(val_acc=correct / total, val_acc_ema=correct_ema / total)
+                total_f1 += cur_f1.item()
+                if use_ema:
+                    ema_correct += (predicted_ema == targets).sum().item()
+                    total_ema_f1 += cur_ema_f1.item()
+                
+                if use_ema:
+                    pbar.set_postfix(val_acc=correct / total, ema_val_acc=ema_correct / total, 
+                                     val_f1=total_f1 / (i + 1), ema_val_f1=total_ema_f1 / (i + 1))
+                else:
+                    pbar.set_postfix(val_acc=correct / total, val_f1=total_f1 / (i + 1))
 
-            if logger:
-                logger.add_scalar('Accuracy/val', correct / total, epoch + 1)
+            logger.add_scalar('Loss/val', val_loss / len(val_loader), epoch + 1)
+            logger.add_scalar('Accuracy/val', correct / total, epoch + 1)
+            logger.add_scalar('F1 score/val', total_f1 / (i + 1), epoch + 1)
+            if use_ema:
+                logger.add_scalar('EMA accuracy/val', ema_correct / total, epoch + 1)
+                logger.add_scalar('EMA F1 score/val', total_ema_f1 / (i + 1), epoch + 1)
 
+        val_loss /= len(val_loader)
         acc = correct / total
-        acc_ema = correct_ema / total
-        cnt_not_improve += 1
-        if acc > best_acc:
-            print(f"Val accuracy improved: {best_acc:.4f} ===> {acc:.4f}")
-            best_acc = acc
-            best_train_acc = train_acc
-            best_model = copy.deepcopy(model)
-            if ckpt_path:
-                model_path = os.path.join(ckpt_path, f"epoch_{epoch + 1}_val_acc_{round(acc, 2)}.pth")
-                torch.save(model.state_dict(), model_path)
-            cnt_not_improve = 0
+        f1 = total_f1 / len(val_loader)
+        if use_ema:
+            ema_acc = ema_correct / total
+            ema_f1 = total_ema_f1 / len(val_loader)
         
-        if acc_ema > best_acc:
-            print(f"EMA val accuracy improved: {best_acc:.4f} ===> {acc_ema:.4f}")
-            best_acc = acc_ema
-            best_train_acc = train_acc_ema
-            best_model = copy.deepcopy(model_ema.module)
-            if ckpt_path:
-                model_path = os.path.join(ckpt_path, f"epoch_{epoch + 1}_ema_val_acc_{round(acc_ema, 2)}.pth")
-                torch.save(model_ema.module.state_dict(), model_path)
-            cnt_not_improve = 0
+        if use_ema:
+            df.loc[len(df)] = [epoch, f1, ema_f1, acc, ema_acc, train_f1, train_ema_f1, train_acc, train_ema_acc]
+        else:
+            df.loc[len(df)] = [epoch, f1, acc, train_f1, train_acc]
         
-        elif math.isclose(acc, best_acc, abs_tol=1e-6) and best_train_acc < train_acc:
-            print(f"Train accuracy improved: {best_train_acc:.4f} ===> {train_acc:.4f}")
-            best_train_acc = train_acc
-            best_model = copy.deepcopy(model)
-            if ckpt_path:
-                model_path = os.path.join(ckpt_path, f"epoch_{epoch + 1}_train_acc_{round(train_acc, 2)}.pth")
-                torch.save(model.state_dict(), model_path)
-            cnt_not_improve = 0
+        df.to_csv(os.path.join(ckpt_path, 'train_logs.csv'), lineterminator='\n', index=False)
             
-        elif math.isclose(acc_ema, best_acc, abs_tol=1e-6) and best_train_acc < train_acc_ema:
-            print(f"EMA train accuracy improved: {best_train_acc:.4f} ===> {train_acc_ema:.4f}")
-            best_train_acc = train_acc_ema
-            best_model = copy.deepcopy(model)
+        cur_metric = {
+            'f1': f1,
+            'train_f1': train_f1,
+            'acc': acc,
+            'train_acc': train_acc
+        }
+        
+        cnt_not_improve += 1
+        if check_classification_model_metric_is_best(best_metric, cur_metric):
+            best_metric = cur_metric.copy()
+            
             if ckpt_path:
-                model_path = os.path.join(ckpt_path, f"epoch_{epoch + 1}_train_acc_{round(train_acc, 2)}.pth")
-                torch.save(model.state_dict(), model_path)
+                model_path = os.path.join(ckpt_path, f"epoch_{epoch + 1}.pth")
+            else:
+                model_path = f"epoch_{epoch + 1}.pth"
+            torch.save(model.state_dict(), model_path)
+            
             cnt_not_improve = 0
+        
+        if use_ema:
+            cur_ema_metric = {
+                'f1': ema_f1,
+                'train_f1': train_ema_f1,
+                'acc': ema_acc,
+                'train_acc': train_ema_acc
+            }
+            
+            if check_classification_model_metric_is_best(best_metric, cur_ema_metric):
+                best_metric = cur_ema_metric.copy()
+                model_path = os.path.join(ckpt_path, f"epoch_{epoch + 1}.pth")
+                torch.save(model_ema.module.state_dict(), model_path)
+                
+                cnt_not_improve = 0
             
         if patience and cnt_not_improve >= patience:
             print(f"Early stopping after {patience} of not improving!")
             break
         
-        if not update_scheduler_by_iter:  # Update scheduler after each epoch, probably ReduceLRByPlateau
-            if update_scheduler_with_metric:
-                scheduler.step(metrics=acc)  # On plateau scheduler
-            else:
-                scheduler.step()
-            
-    if ckpt_path:
-        last_model_path = os.path.join(ckpt_path, f"last.pth")
-        torch.save(model.state_dict(), last_model_path)
-        
-    return best_model, best_acc, best_train_acc
+    last_model_path = os.path.join(ckpt_path, "last.pth")
+    torch.save(model.state_dict(), last_model_path)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default=None)
-    parser.add_argument('--ckpt-path', type=str, default=None)
-    parser.add_argument('--log-path', type=str, default=None)
-    parser.add_argument('--device', type=int, default=-1)
-    parser.add_argument('--n-worker', type=int, default=4)
+    parser.add_argument('--aug-config', type=str)
+    parser.add_argument('--data-config', type=str)
+    parser.add_argument('--model-config', type=str)
+    parser.add_argument('--train-config', type=str)
     args = parser.parse_args()
     
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
-    train_config = config['train']
-    model_config = config['model']
-    teacher_model_config = config['teacher_model']
-    optimizer_config = config['optimizer']
-    scheduler_config = config['scheduler']
-    loss_config = config['loss']
-    data_config = config['dataset']
-    preprocess_config = config['preprocess']
-    seed = train_config.get('seed', None)
-
-    if seed:
-        set_all_seeds(seed)
-
-    use_gpu = torch.cuda.is_available() and args.device != -1
-    device = torch.device(f"cuda:{args.device}" if use_gpu else "cpu")
-
-    train_loader, n_classes = create_data_loader(
-        dataset_config=data_config,
-        image_config=preprocess_config,
-        num_worker=args.n_worker,
-        mode='train',
-        return_classes=False,
-        random_seed=args.seed
-    )
-    val_loader, _ = create_data_loader(
-        dataset_config=data_config,
-        image_config=preprocess_config,
-        num_worker=args.n_worker,
-        mode='val',
-        return_classes=False,
-        random_seed=args.seed
-    )
-
-    teacher_model = build_timm_model(config=teacher_model_config, n_classes=n_classes, device=device, phase='val')
-    print('Teacher model')
-    model_summary(teacher_model)
-    
-    model = build_timm_model(config=model_config, n_classes=n_classes, device=device, phase='train')
-    print('Student model')
-    model_summary(model)
-    
-    if loss_config is not None:
-        smoothing = loss_config.get('smoothing', 0.)
-        weight = loss_config.get('weight', None)
-        if weight:
-            weight = torch.Tensor(weight).to(device)
-        criterion = nn.CrossEntropyLoss(label_smoothing=smoothing, weight=weight)
-    else:
-        criterion = nn.CrossEntropyLoss()
-
-    optimizer = torch_optimizer_factory(optimizer_config, model.parameters())
-    scheduler = scheduler_factory(scheduler_config, optimizer)
-
-    date_str = datetime.now().strftime('%Y%m%d-%H%M')
-    if args.ckpt_path is not None:
-        ckpt_path = os.path.join(args.ckpt_path, date_str)
-        os.makedirs(ckpt_path, exist_ok=True)
-    else:
-        ckpt_path = None
-    if args.log_path is not None:
-        log_path = os.path.join(args.log_path, date_str)
-    else:
-        log_path = None
-
-    config_to_save = {
-        'arch': model_config['arch'],
-        'n_classes': n_classes,
-        'imgsz': preprocess_config['imgsz'],
-        'mean': preprocess_config.get('mean', None),
-        'std': preprocess_config.get('std', None)
-    }
-    json.dump(config_to_save, open(os.path.join(ckpt_path, 'model_config.json'), 'w'))
+    with open(args.aug_config, 'r') as f:
+        aug_config = yaml.safe_load(f)
+    with open(args.data_config, 'r') as f:
+        dataset_config = yaml.safe_load(f)
+    with open(args.model_config, 'r') as f:
+        model_config = yaml.safe_load(f)
+    with open(args.train_config, 'r') as f:
+        train_config = yaml.safe_load(f)
         
-    best_model, best_acc, best_train_acc = train(
-        model=model,
-        teacher_model=teacher_model,
-        device=device,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        alpha=loss_config['alpha'],
-        temperature=loss_config['temperature'],
-        optimizer=optimizer,
-        scheduler=scheduler,
-        update_scheduler_by_iter=scheduler_config.get('update_by_iter', False),
-        update_scheduler_with_metric=scheduler_config.get('use_metric', False),
-        epochs=train_config['epochs'],
-        patience=train_config.get('patience', None),
-        ckpt_path=ckpt_path,
-        log_path=log_path
+    train(
+        aug_config=aug_config,
+        dataset_config=dataset_config,
+        model_config=model_config,
+        train_config=train_config
     )

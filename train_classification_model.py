@@ -1,9 +1,7 @@
 import argparse
-import copy
-import math
+import json
 import os
 import random
-import json
 import torch
 import warnings
 import yaml
@@ -17,7 +15,9 @@ from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 from torchmetrics import F1Score
 
-from vision_classification import build_timm_model, model_summary, create_data_loader
+from deep_learning_utils import build_timm_model
+from data_utils import create_data_loader
+from misc_utils import check_classification_model_metric_is_best, model_summary
 
 warnings.filterwarnings("ignore")
 
@@ -29,43 +29,29 @@ def set_all_seeds(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
-    
-    
-def check_model_metric_is_best(best_metric, cur_metric):
-    metric_names = ['f1', 'train_f1', 'acc', 'train_acc']
-    for metric in metric_names:
-        best = best_metric[metric]
-        cur = cur_metric[metric]
-        if best < cur:
-            print(f"{metric} improved: {best:.4f} ===> {cur:.4f}")
-            return True
-        if not math.isclose(cur, best, abs_tol=1e-6):
-            return False
-    return False
 
 
 def train(
-    train_config,
-    model_config,
+    aug_config,
     dataset_config,
-    image_config,
-    device_config
+    model_config,
+    train_config
 ):
     seed = train_config.get('random_seed', None)
     if seed:
         set_all_seeds(seed)
 
-    device_id = device_config.get('device_id', -1)
+    device_id = train_config.get('device_id', -1)
     use_gpu = torch.cuda.is_available() and device_id != -1
     device = torch.device(f"cuda:{device_id}" if use_gpu else "cpu")
-    num_workers = device_config.get('num_worker', 1)
+    num_workers = train_config.get('num_worker', 1)
     
     num_epochs = train_config.get('epochs', 1)
     patience = train_config.get('patience', None)
 
     train_loader, n_classes = create_data_loader(
         dataset_config=dataset_config,
-        image_config=image_config,
+        aug_config=aug_config,
         num_worker=num_workers,
         mode='train',
         return_classes=False,
@@ -73,7 +59,7 @@ def train(
     )
     val_loader, _ = create_data_loader(
         dataset_config=dataset_config,
-        image_config=image_config,
+        aug_config=aug_config,
         num_worker=num_workers,
         mode='val',
         return_classes=False,
@@ -99,26 +85,26 @@ def train(
     
     use_ema = train_config.get('ema', False)
 
+    exp_name = train_config.get('exp', 'exp')
     date_str = datetime.now().strftime('%Y%m%d-%H%M')
-    ckpt_path = train_config.get('ckpt_path', None)
-    if ckpt_path is not None:
-        ckpt_path = os.path.join(ckpt_path, date_str)
-        os.makedirs(ckpt_path, exist_ok=True)
-    log_path = train_config.get('log_path', None)
-    if log_path is not None:
-        log_path = os.path.join(log_path, date_str)
 
+    ckpt_path = os.path.join('weights', exp_name, date_str)
+    os.makedirs(ckpt_path, exist_ok=True)
+    log_path = os.path.join('logs', exp_name, date_str)
+
+    resize_cfg = aug_config.get('resize', None)
+    imgsz = None if resize_cfg is None else resize_cfg['imgsz']
+    norm_cfg = aug_config.get('Normalize', None)
+    mean = None if norm_cfg is None else norm_cfg['params']['mean']
+    std = None if norm_cfg is None else norm_cfg['params']['std']
     model_config_to_save = {
         'arch': model_config['arch'],
         'n_classes': n_classes,
-        'imgsz': image_config.get('imgsz', (224, 224)),
-        'mean': image_config.get('mean', (0.485, 0.456, 0.406)),
-        'std': image_config.get('std', (0.229, 0.224, 0.225))
+        'imgsz': imgsz,
+        'mean': mean,
+        'std': std
     }
-    if ckpt_path:
-        json.dump(model_config_to_save, open(os.path.join(ckpt_path, 'model_config.json'), 'w'))
-    else:
-        json.dump(model_config_to_save, open('model_config.json', 'w'))
+    json.dump(model_config_to_save, open(os.path.join(ckpt_path, 'model_config.json'), 'w'))
 
     if use_ema:
         df = pd.DataFrame(columns=['epoch', 'val_f1', 'val_ema_f1', 'val_acc', 'val_ema_acc', 
@@ -133,11 +119,8 @@ def train(
         'train_acc': float('-inf')
     }
     
-    if log_path:
-        logger = SummaryWriter(log_path)
-        logger.add_scalar('Accuracy/val', 0., 0)
-    else:
-        logger = None
+    logger = SummaryWriter(log_path)
+    logger.add_scalar('Accuracy/val', 0., 0)
     
     if use_ema:
         model_ema = ModelEmaV2(model=model, device=device, decay=0.998)
@@ -157,11 +140,13 @@ def train(
     for epoch in range(num_epochs):
         model.train()
         pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Train epoch {epoch + 1}/{num_epochs}")
+        
         total = 0
         correct = 0
         ema_correct = 0
         total_f1 = 0
         total_ema_f1 = 0
+        
         for i, (images, targets) in pbar:
             images = images.to(device)
             targets = targets.to(device)
@@ -207,16 +192,15 @@ def train(
             else:
                 pbar.set_postfix(loss=loss.item(), train_acc=correct / total, f1=total_f1 / (i + 1), lr=lr)
             
-            if logger:
-                logger.add_scalar('Loss/train', loss.item(), epoch * len(train_loader) + i)
-                logger.add_scalar('Accuracy/train', correct / total, epoch * len(train_loader) + i)
-                logger.add_scalar('F1 score/train', total_f1 / (i + 1), epoch * len(train_loader) + i)
-                logger.add_scalar('Learning rate', lr, epoch * len(train_loader) + i)
-                
-                if use_ema:
-                    logger.add_scalar('EMA loss/train', ema_loss.item(), epoch * len(train_loader) + i)
-                    logger.add_scalar('EMA accuracy/train', ema_correct / total, epoch * len(train_loader) + i)
-                    logger.add_scalar('EMA F1 score/train', total_ema_f1 / (i + 1), epoch * len(train_loader) + i)
+            logger.add_scalar('Loss/train', loss.item(), epoch * len(train_loader) + i)
+            logger.add_scalar('Accuracy/train', correct / total, epoch * len(train_loader) + i)
+            logger.add_scalar('F1 score/train', total_f1 / (i + 1), epoch * len(train_loader) + i)
+            logger.add_scalar('Learning rate', lr, epoch * len(train_loader) + i)
+            
+            if use_ema:
+                logger.add_scalar('EMA loss/train', ema_loss.item(), epoch * len(train_loader) + i)
+                logger.add_scalar('EMA accuracy/train', ema_correct / total, epoch * len(train_loader) + i)
+                logger.add_scalar('EMA F1 score/train', total_ema_f1 / (i + 1), epoch * len(train_loader) + i)
                 
             with warmup_scheduler.dampening():
                 if warmup_scheduler.last_step + 1 >= warmup_iters:
@@ -230,12 +214,14 @@ def train(
         
         model.eval()
         pbar = tqdm(enumerate(val_loader), total=len(val_loader), desc=f"Val epoch {epoch + 1}/{num_epochs}")
+        
         total = 0
         correct = 0
         ema_correct = 0
         total_f1 = 0
         total_ema_f1 = 0
         val_loss = 0
+        
         with torch.no_grad():
             for i, (images, targets) in pbar:
                 images = images.to(device)
@@ -248,9 +234,9 @@ def train(
                     if model_ema:
                         outputs_ema = model_ema.module(images)
                 
-                scores, predicted = torch.max(outputs.data, 1)
+                _, predicted = torch.max(outputs.data, 1)
                 if use_ema:
-                    scores_ema, predicted_ema = torch.max(outputs_ema.data, 1)
+                    _, predicted_ema = torch.max(outputs_ema.data, 1)
                 
                 cur_f1 = f1_score(predicted, targets)
                 if use_ema:
@@ -269,13 +255,12 @@ def train(
                 else:
                     pbar.set_postfix(val_acc=correct / total, val_f1=total_f1 / (i + 1))
 
-            if logger:
-                logger.add_scalar('Loss/val', val_loss / len(val_loader), epoch + 1)
-                logger.add_scalar('Accuracy/val', correct / total, epoch + 1)
-                logger.add_scalar('F1 score/val', total_f1 / (i + 1), epoch + 1)
-                if use_ema:
-                    logger.add_scalar('EMA accuracy/val', ema_correct / total, epoch + 1)
-                    logger.add_scalar('EMA F1 score/val', total_ema_f1 / (i + 1), epoch + 1)
+            logger.add_scalar('Loss/val', val_loss / len(val_loader), epoch + 1)
+            logger.add_scalar('Accuracy/val', correct / total, epoch + 1)
+            logger.add_scalar('F1 score/val', total_f1 / (i + 1), epoch + 1)
+            if use_ema:
+                logger.add_scalar('EMA accuracy/val', ema_correct / total, epoch + 1)
+                logger.add_scalar('EMA F1 score/val', total_ema_f1 / (i + 1), epoch + 1)
         
         val_loss /= len(val_loader)
         acc = correct / total
@@ -289,10 +274,7 @@ def train(
         else:
             df.loc[len(df)] = [epoch, f1, acc, train_f1, train_acc]
         
-        if ckpt_path:
-            df.to_csv(os.path.join(ckpt_path, 'train_logs.csv'), lineterminator='\n', index=False)
-        else:
-            df.to_csv('train_logs.csv', lineterminator='\n', index=False)
+        df.to_csv(os.path.join(ckpt_path, 'train_logs.csv'), lineterminator='\n', index=False)
             
         cur_metric = {
             'f1': f1,
@@ -302,13 +284,9 @@ def train(
         }
         
         cnt_not_improve += 1
-        if check_model_metric_is_best(best_metric, cur_metric):
+        if check_classification_model_metric_is_best(best_metric, cur_metric):
             best_metric = cur_metric.copy()
-            
-            if ckpt_path:
-                model_path = os.path.join(ckpt_path, f"epoch_{epoch + 1}.pth")
-            else:
-                model_path = f"epoch_{epoch + 1}.pth"
+            model_path = os.path.join(ckpt_path, f"epoch_{epoch + 1}.pth")
             torch.save(model.state_dict(), model_path)
             
             cnt_not_improve = 0
@@ -321,13 +299,9 @@ def train(
                 'train_acc': train_ema_acc
             }
             
-            if check_model_metric_is_best(best_metric, cur_ema_metric):
+            if check_classification_model_metric_is_best(best_metric, cur_ema_metric):
                 best_metric = cur_ema_metric.copy()
-                
-                if ckpt_path:
-                    model_path = os.path.join(ckpt_path, f"epoch_{epoch + 1}.pth")
-                else:
-                    model_path = f"epoch_{epoch + 1}.pth"
+                model_path = os.path.join(ckpt_path, f"epoch_{epoch + 1}.pth")
                 torch.save(model_ema.module.state_dict(), model_path)
                 
                 cnt_not_improve = 0
@@ -336,30 +310,30 @@ def train(
             print(f"Early stopping after {patience} of not improving!")
             break
             
-    if ckpt_path:
-        last_model_path = os.path.join(ckpt_path, "last.pth")
-    else:
-        last_model_path = "last.pth"
+    last_model_path = os.path.join(ckpt_path, "last.pth")
     torch.save(model.state_dict(), last_model_path)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('config', type=str)
+    parser.add_argument('--aug-config', type=str)
+    parser.add_argument('--data-config', type=str)
+    parser.add_argument('--model-config', type=str)
+    parser.add_argument('--train-config', type=str)
     args = parser.parse_args()
     
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
-    train_config = config['train_config']
-    model_config = config['model']
-    dataset_config = config['dataset']
-    image_config = config['image_config']
-    device_config = config['device_config']
+    with open(args.aug_config, 'r') as f:
+        aug_config = yaml.safe_load(f)
+    with open(args.data_config, 'r') as f:
+        dataset_config = yaml.safe_load(f)
+    with open(args.model_config, 'r') as f:
+        model_config = yaml.safe_load(f)
+    with open(args.train_config, 'r') as f:
+        train_config = yaml.safe_load(f)
         
     train(
-        train_config=train_config,
-        model_config=model_config,
+        aug_config=aug_config,
         dataset_config=dataset_config,
-        image_config=image_config,
-        device_config=device_config
+        model_config=model_config,
+        train_config=train_config
     )

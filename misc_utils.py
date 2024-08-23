@@ -1,8 +1,4 @@
-from .classification import binary_classify, binary_classify_onnx, classify, classify_onnx
-from .dataset import ImageDataset, CustomSampleImageDataset, create_data_loader
-from .image_processing_and_augmentation import albu_img_prepro, albu_img_aug_pipeline
-from .timm_models import build_timm_model
-
+import math
 from prettytable import PrettyTable
 
 
@@ -28,3 +24,16 @@ def model_summary(model):
     print(f"Total params: {total_params}")
     print(f"Total trainable params: {total_trainable_params}")
     print()
+
+
+def check_classification_model_metric_is_best(best_metric, cur_metric):
+    metric_names = ['f1', 'train_f1', 'acc', 'train_acc']
+    for metric in metric_names:
+        best = best_metric[metric]
+        cur = cur_metric[metric]
+        if best < cur:
+            print(f"{metric} improved: {best:.4f} ===> {cur:.4f}")
+            return True
+        if not math.isclose(cur, best, abs_tol=1e-6):
+            return False
+    return False

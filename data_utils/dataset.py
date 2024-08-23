@@ -8,7 +8,7 @@ import pandas as pd
 from glob import glob
 from torch.utils import data
 
-from .image_processing_and_augmentation import albu_img_aug_pipeline
+from .image_processing_and_augmentation import build_augmentation_pipeline
 
 IMAGE_EXTS = ['jpg', 'png', 'jpeg', 'JPG', 'PNG', 'JPEG']
 
@@ -226,24 +226,14 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 
-def create_data_loader(dataset_config, image_config, num_worker=8, mode='train',
+def create_data_loader(dataset_config, aug_config, num_worker=8, mode='train',
                        return_classes=False, random_seed=None):
     image_root = dataset_config.get(f'{mode}_root', None)
     annotation_file = dataset_config.get(f'{mode}_label', None)
 
-    mean = image_config.get('mean', [0.485, 0.456, 0.406])
-    std = image_config.get('std', [0.229, 0.224, 0.225])
-    imgsz = image_config.get('imgsz', [224, 224])
-    aug_level = image_config.get('aug_level', None)
-    to_rgb = image_config.get('to_rgb', True)
+    to_rgb = aug_config.get('to_rgb', True)
     
-    pipeline = albu_img_aug_pipeline(
-        aug_level=aug_level,
-        imgsz=imgsz,
-        mean=mean,
-        std=std,
-        phase=mode
-    )
+    pipeline = build_augmentation_pipeline(aug_config['augmentations'], to_tensor=True, wrap=False)
 
     if mode == 'train':
         class_sampling_ratio = dataset_config.get('class_sample_ratio', None)

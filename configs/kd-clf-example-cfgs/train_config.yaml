@@ -1,0 +1,10 @@
+device_id: 0
+num_worker: 4
+random_seed: 42
+alpha: 0.95
+temperature: 6
+lr: 2.0e-4
+epochs: 60
+patience: null
+ema: true
+exp: kd_classify_dog_cat
