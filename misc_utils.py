@@ -27,7 +27,7 @@ def model_summary(model):
 
 
 def check_classification_model_metric_is_best(best_metric, cur_metric):
-    metric_names = ['f1', 'train_f1', 'acc', 'train_acc']
+    metric_names = ['acc', 'train_acc', 'f1', 'train_f1']
     for metric in metric_names:
         best = best_metric[metric]
         cur = cur_metric[metric]

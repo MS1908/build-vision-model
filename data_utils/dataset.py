@@ -7,8 +7,9 @@ import numpy as np
 import pandas as pd
 from glob import glob
 from torch.utils import data
+from albumentations.pytorch import ToTensorV2
 
-from .image_processing_and_augmentation import build_augmentation_pipeline
+from .image_processing_and_augmentation import build_augmentation_pipeline, build_resize_pipeline_albu
 
 IMAGE_EXTS = ['jpg', 'png', 'jpeg', 'JPG', 'PNG', 'JPEG']
 
@@ -231,9 +232,17 @@ def create_data_loader(dataset_config, aug_config, num_worker=8, mode='train',
     image_root = dataset_config.get(f'{mode}_root', None)
     annotation_file = dataset_config.get(f'{mode}_label', None)
 
-    to_rgb = aug_config.get('to_rgb', True)
+    prepro_config = aug_config['preprocess']
+    aug_config = aug_config['augmentations']
+    to_rgb = prepro_config.get('to_rgb', True)
     
-    pipeline = build_augmentation_pipeline(aug_config['augmentations'], to_tensor=True, wrap=False)
+    resize = build_resize_pipeline_albu(prepro_config['imgsz'])
+    aug = build_augmentation_pipeline(aug_config, wrap=False)
+    norm = [
+        A.Normalize(mean=prepro_config['mean'], std=prepro_config['std']),
+        ToTensorV2(transpose_mask=True)
+    ]
+    pipeline = resize + aug + norm
 
     if mode == 'train':
         class_sampling_ratio = dataset_config.get('class_sample_ratio', None)

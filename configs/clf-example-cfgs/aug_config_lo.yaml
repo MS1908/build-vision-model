@@ -1,7 +1,10 @@
-augmentations:
-  - name: resize
-    imgsz: 224
+preprocess:
+  imgsz: 224
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  to_rgb: true
 
+augmentations:
   - name: GaussNoise
     params:
       p: 0.2
@@ -39,10 +42,3 @@ augmentations:
   - name: ImageCompression
     params:
       quality_lower: 90
-
-  - name: Normalize
-    params:
-      mean: [0.485, 0.456, 0.406]
-      std: [0.229, 0.224, 0.225]
-
-to_rgb: true

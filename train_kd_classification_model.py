@@ -95,11 +95,9 @@ def train(
     os.makedirs(ckpt_path, exist_ok=True)
     log_path = os.path.join('logs', exp_name, date_str)
 
-    resize_cfg = aug_config.get('resize', None)
-    imgsz = None if resize_cfg is None else resize_cfg['imgsz']
-    norm_cfg = aug_config.get('Normalize', None)
-    mean = None if norm_cfg is None else norm_cfg['params']['mean']
-    std = None if norm_cfg is None else norm_cfg['params']['std']
+    imgsz = aug_config['preprocess']['imgsz']
+    mean = aug_config['preprocess']['mean']
+    std = aug_config['preprocess']['std']
     model_config_to_save = {
         'arch': model_config['student_model']['arch'],
         'n_classes': n_classes,
@@ -116,10 +114,10 @@ def train(
         df = pd.DataFrame(columns=['epoch', 'val_f1', 'val_acc', 'train_f1', 'train_acc'])
     
     best_metric = {
-        'f1': float('-inf'),
-        'train_f1': float('-inf'),
         'acc': float('-inf'),
-        'train_acc': float('-inf')
+        'train_acc': float('-inf'),
+        'f1': float('-inf'),
+        'train_f1': float('-inf')
     }
     
     logger = SummaryWriter(log_path)
@@ -284,10 +282,10 @@ def train(
         df.to_csv(os.path.join(ckpt_path, 'train_logs.csv'), lineterminator='\n', index=False)
             
         cur_metric = {
-            'f1': f1,
-            'train_f1': train_f1,
             'acc': acc,
-            'train_acc': train_acc
+            'train_acc': train_acc,
+            'f1': f1,
+            'train_f1': train_f1
         }
         
         cnt_not_improve += 1
@@ -304,10 +302,10 @@ def train(
         
         if use_ema:
             cur_ema_metric = {
-                'f1': ema_f1,
-                'train_f1': train_ema_f1,
                 'acc': ema_acc,
-                'train_acc': train_ema_acc
+                'train_acc': train_ema_acc,
+                'f1': ema_f1,
+                'train_f1': train_ema_f1
             }
             
             if check_classification_model_metric_is_best(best_metric, cur_ema_metric):

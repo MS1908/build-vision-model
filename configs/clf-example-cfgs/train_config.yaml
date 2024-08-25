@@ -3,7 +3,7 @@ num_worker: 4
 random_seed: 42
 loss_smoothing: 0.2
 lr: 1.0e-3
-epochs: 60
+epochs: 10
 patience: null
 ema: true
 exp: classify_dog_cat

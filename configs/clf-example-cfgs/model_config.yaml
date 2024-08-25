@@ -1,4 +1,4 @@
-arch: convnext_atto
+arch: mobilenetv3_small_050
 pretrained: true
 ckpt_path: null
 n_block_to_train: -1

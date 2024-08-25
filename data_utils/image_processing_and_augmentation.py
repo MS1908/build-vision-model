@@ -10,7 +10,7 @@ def build_resize_pipeline_albu(imgsz=(224, 224)):
         
         if len(imgsz) == 2:
             target_h, target_w = imgsz
-            resize_pipeline = A.Resize(height=target_h, width=target_w)
+            resize_pipeline = [A.Resize(height=target_h, width=target_w)]
         else:
             # Only longest size is provided
             resize_pipeline = [
@@ -142,10 +142,6 @@ def parse_augmentation(config):
         # Parse the augmentations inside OneOf
         augmentations = [parse_augmentation(aug) for aug in config['augmentations']]
         return A.OneOf(augmentations, **aug_params)
-    
-    elif aug_name == 'resize':
-        augmentations = build_resize_pipeline_albu(config['imgsz'])
-        return A.Compose(augmentations)
 
     else:
         aug_class = getattr(A, aug_name)
@@ -161,10 +157,8 @@ class AlbumentationsWrapper:
         return self.transform(image=input_img)['image']
 
 
-def build_augmentation_pipeline(aug_config, to_tensor=True, wrap=False):
+def build_augmentation_pipeline(aug_config, wrap=False):
     pipeline = [parse_augmentation(config) for config in aug_config]
-    if to_tensor:
-        pipeline.append(ToTensorV2(transpose_mask=True))
 
     if not wrap:
         return pipeline

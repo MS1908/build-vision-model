@@ -92,11 +92,9 @@ def train(
     os.makedirs(ckpt_path, exist_ok=True)
     log_path = os.path.join('logs', exp_name, date_str)
 
-    resize_cfg = aug_config.get('resize', None)
-    imgsz = None if resize_cfg is None else resize_cfg['imgsz']
-    norm_cfg = aug_config.get('Normalize', None)
-    mean = None if norm_cfg is None else norm_cfg['params']['mean']
-    std = None if norm_cfg is None else norm_cfg['params']['std']
+    imgsz = aug_config['preprocess']['imgsz']
+    mean = aug_config['preprocess']['mean']
+    std = aug_config['preprocess']['std']
     model_config_to_save = {
         'arch': model_config['arch'],
         'n_classes': n_classes,
